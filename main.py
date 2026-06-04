@@ -39,26 +39,45 @@ FORBIDDEN_CLASS_PAIRS = [
     ("container",       {"w-100", "mx-auto", "d-block"}),
     ("container-fluid", {"w-100", "mx-auto", "d-block"}),
     ("d-*",             {"d-*"}),
+    ("pt-#",            {"pb-#"}),
+    ("mt-#",            {"mb-#"}),
+    ("me-#",            {"ms-#"}),
+    ("shadow",          {"shadow-*"}),
     ("overflow-*",      {"overflow-*"}),
     ("img-fluid",       {"mw-100"}),
     ("d-flex",          {"flex-row", "align-items-stretch"}),
 ]
-CLASS_ATTRS            = {"class", "t-att-class", "t-attf-class"}
-PT_PB_RE               = re.compile(r'\bpb-?\w+\b|\bpt-?\w+\b')
+CLASS_ATTRS = {"class", "t-att-class", "t-attf-class"}
 
 # XML – data-attribute names to forbid
-FORBIDDEN_DATA_ATTRS = {
+FORBIDDEN_ATTRIBUTES = {
+    ("loading", "lazy"),
     "data-mimetype",
+    "data-aspect-ratio",
     "data-original-id",
     "data-original-src",
     "data-original-title",
+    "data-scale-x",
+    "data-scale-y"
 }
 
+EMPTY_ATTRS = {"add", "remove", "style"}
+
 # XML – text-align replacements
-TEXT_ALIGN_MAP = {
-    "text-align: center;": "text-center",
-    "text-align: left;":   "text-start",
-    "text-align: right;":  "text-end",
+FORBIDDEN_STYLE = {
+    "background-image: none;",
+    "padding:",
+    "padding-*:",
+    "margin:",
+    "margin-*:",
+    ("position: *;", "position-*"),
+    ("text-align: center;", "text-center"),
+    ("text-align: left;", "text-start"),
+    ("text-align: right;", "text-end"),
+    ("border-left-color", "border-{color}"),
+    ("border-bottom-color", "border-{color}"),
+    ("border-right-color", "border-{color}"),
+    ("border-top-color", "border-{color}"),
 }
 
 # HTML void / self-closing elements that are legitimately empty
@@ -87,11 +106,18 @@ def read_text(path: str) -> str:
         return ""
 
 def _pattern_prefix(pattern: str) -> str | None:
-    return pattern[:-1] if pattern.endswith("*") else None
+    return pattern[:-1] if pattern.endswith(("*", "#")) else None
 
 def _matches_class_pattern(token: str, pattern: str) -> bool:
     prefix = _pattern_prefix(pattern)
     return token.startswith(prefix) if prefix else token == pattern
+
+def _pattern_is_exact(pattern: str) -> bool:
+    return pattern.endswith("#")
+
+def _get_suffix(token: str, prefix: str) -> str:
+    """Return everything after the prefix."""
+    return token[len(prefix):]
 
 def _get_breakpoint(token: str, prefix: str) -> str:
     rest = token[len(prefix):]
@@ -150,7 +176,7 @@ def check_scss_file(path: str) -> list[Violation]:
 # Regex to grab all attributes of a tag as a raw string (handles most template tags)
 _TAG_RE   = re.compile(r'<([A-Za-z][A-Za-z0-9_:-]*)((?:\s[^>]*?)?)/?>',   re.DOTALL)
 _ATTR_RE  = re.compile(r"""([\w:@-]+)\s*=\s*(?:"([^"]*)"|'([^']*)')""")
-
+_HEADING_RE = re.compile(r'<(h[1-6])\b', re.IGNORECASE)
 
 def _attrs(attr_str: str) -> dict[str, str]:
     """Return {name: value} for all attributes in a raw attribute string."""
@@ -199,36 +225,62 @@ def check_xml_file(path: str, scss_js_content: str = "") -> list[Violation]:
                         violations.append((lineno,
                             f"<{tag}> has duplicate class(es): {', '.join(sorted(dupes))}"))
 
-            # 4. <img> without alt
+            # 3. <img> without alt
             if tag == "img" and "alt" not in attrs and "t-att-alt" not in attrs:
                 violations.append((lineno, "<img> tag is missing an 'alt' attribute"))
 
-            # 5. forbidden data-* attributes
-            for da in FORBIDDEN_DATA_ATTRS:
-                if da in attrs:
-                    violations.append((lineno, f"<{tag}> has forbidden attribute '{da}'"))
+            # 4. forbidden attributes (exact name, or name+value pair)
+            for entry in FORBIDDEN_ATTRIBUTES:
+                if isinstance(entry, tuple):
+                    attr_name, forbidden_val = entry
+                    if attrs.get(attr_name, "").lower() == forbidden_val:
+                        violations.append((lineno,
+                            f"<{tag}> has forbidden attribute '{attr_name}=\"{forbidden_val}\"'"))
+                else:
+                    if entry in attrs:
+                        violations.append((lineno,
+                            f"<{tag}> has forbidden attribute '{entry}'"))
 
-            # 6. loading="lazy"
-            if attrs.get("loading", "").lower() == "lazy":
-                violations.append((lineno, f"<{tag}> uses loading=\"lazy\""))
+            # 5. empty EMPTY_ATTRS attributes
+            for ea in EMPTY_ATTRS:
+                if ea in attrs and attrs[ea].strip() == "":
+                    violations.append((lineno, f"<{tag}> has empty '{ea}' attribute"))
+
+            # 6. width / height must be pure numbers
+            for dim_attr in ("width", "height"):
+                dim_val = attrs.get(dim_attr, None)
+                if dim_val is not None and not re.fullmatch(r'\d+', dim_val.strip()):
+                    violations.append((lineno,
+                        f"<{tag}> has non-numeric '{dim_attr}' attribute value: \"{dim_val}\""))
 
             # 7. style checks
             style_val = attrs.get("style", None)
             if style_val is not None:
-                # 7a. empty style
-                if style_val.strip() == "":
-                    violations.append((lineno, f"<{tag}> has empty style attribute"))
-
-                # 7b. inline text-align
-                for ta_needle, bs_class in TEXT_ALIGN_MAP.items():
-                    if ta_needle in style_val:
-                        violations.append((lineno,
-                            f"<{tag}> has \"{ta_needle}\" in style — use Bootstrap class '{bs_class}' instead"))
-
-                # 7c. background-image: none
-                if "background-image: none;" in style_val:
-                    violations.append((lineno,
-                        f"<{tag}> has \"background-image: none;\" in style attribute"))
+                for entry in FORBIDDEN_STYLE:
+                    if isinstance(entry, str):
+                        prop = entry.rstrip("*:").rstrip("-")
+                        if re.search(r'(?<![a-zA-Z-])\b' + re.escape(prop) + r'[-\w]*\s*:', style_val):
+                            violations.append((lineno,
+                                f"<{tag}> has \"{entry}\" in style attribute — remove it"))
+                    else:
+                        needle, suggestion = entry
+                        prop, _, pattern_val = needle.partition(": ")
+                        if pattern_val.rstrip(";").strip() == "*":
+                            m = re.search(
+                                r'(?<![a-zA-Z-])\b' + re.escape(prop) + r'\s*:\s*([^;]+);',
+                                style_val,
+                            )
+                            if m:
+                                actual_val = m.group(1).strip()
+                                class_suggestion = suggestion.replace("*", actual_val)
+                                violations.append((lineno,
+                                    f"<{tag}> has \"{prop}: {actual_val};\" in style"
+                                    f" — use CSS class '{class_suggestion}' instead"))
+                        else:
+                            if prop in style_val:
+                                violations.append((lineno,
+                                    f"<{tag}> has \"{prop}\" in style"
+                                    f" — use CSS class '{suggestion}' instead"))
 
             # 8. x_wd_ classes not referenced in SCSS/JS
             for token in all_tokens:
@@ -245,6 +297,7 @@ def check_xml_file(path: str, scss_js_content: str = "") -> list[Violation]:
                     ({anchor_pattern} if anchor_pattern in all_tokens else set())
                 )
                 for anchor_token in anchor_tokens:
+                    anchor_suffix = _get_suffix(anchor_token, anchor_prefix) if anchor_prefix else ""
                     anchor_bp = _get_breakpoint(anchor_token, anchor_prefix) if anchor_prefix else ""
                     bad = set()
                     for t in all_tokens:
@@ -254,19 +307,71 @@ def check_xml_file(path: str, scss_js_content: str = "") -> list[Violation]:
                             if not _matches_class_pattern(t, p):
                                 continue
                             p_prefix = _pattern_prefix(p)
-                            t_bp = _get_breakpoint(t, p_prefix) if p_prefix else ""
-                            if t_bp == anchor_bp:
-                                bad.add(t)
+                            if _pattern_is_exact(p):
+                                t_suffix = _get_suffix(t, p_prefix) if p_prefix else ""
+                                if t_suffix == anchor_suffix:
+                                    bad.add(t)
+                            else:
+                                t_bp = _get_breakpoint(t, p_prefix) if p_prefix else ""
+                                if t_bp == anchor_bp:
+                                    bad.add(t)
                     if bad:
                         violations.append((lineno,
                             f"<{tag}> combines '{anchor_token}' with forbidden class(es): {', '.join(sorted(bad))}"))
 
-        # ---- raw-line checks (not tag-scoped) ----
+    # 10. No headings inside <div id="footer">
+    for footer_m in re.finditer(r'<div\b[^>]*\bid=["\']footer["\'][^>]*>(.*?)</div\s*>', content, re.DOTALL | re.IGNORECASE):
+        headings = _HEADING_RE.findall(footer_m.group(1))
+        if headings:
+            lineno = content[:footer_m.start()].count("\n") + 1
+            violations.append((lineno,
+                f"<div id=\"footer\"> contains heading(s): {', '.join(f'<{h}>' for h in headings)}"))
 
-        # 10. forbidden data attributes (catches multi-attr lines missed by tag regex)
-        for da in FORBIDDEN_DATA_ATTRS:
-            if da in raw and f'"{da}"' not in raw:   # already caught per-tag above; avoid dup
-                pass  # already handled per tag_m loop
+    # 11. No headings inside <field name="mega_menu_content" type="html">
+    for rec_m in re.finditer(
+            r'<record\b[^>]*\bmodel=["\']website\.menu["\'][^>]*>(.*?)</record\s*>',
+            content, re.DOTALL | re.IGNORECASE):
+        for field_m in re.finditer(
+                r'<field\b[^>]*\bname=["\']mega_menu_content["\'][^>]*>(.*?)</field\s*>',
+                rec_m.group(1), re.DOTALL | re.IGNORECASE):
+            headings = _HEADING_RE.findall(field_m.group(1))
+            if headings:
+                lineno = content[:rec_m.start()].count("\n") + 1
+                violations.append((lineno,
+                    f"<record model=\"website.menu\"> mega_menu_content contains heading(s):"
+                    f" {', '.join(f'<{h}>' for h in headings)}"))
+
+    # 12. Heading hierarchy inside <record model="website.page"> arch field
+    for rec_m in re.finditer(
+            r'<record\b[^>]*\bmodel=["\']website\.page["\'][^>]*>(.*?)</record\s*>',
+            content, re.DOTALL | re.IGNORECASE):
+        for field_m in re.finditer(
+                r'<field\b[^>]*\bname=["\']arch["\'][^>]*>(.*?)</field\s*>',
+                rec_m.group(1), re.DOTALL | re.IGNORECASE):
+            headings = [(content[:rec_m.start()].count("\n") + 1
+                         + rec_m.group(1)[:field_m.start()].count("\n")
+                         + field_m.group(1)[:m.start()].count("\n"),
+                         int(m.group(1)[1]))
+                        for m in _HEADING_RE.finditer(field_m.group(1))]
+            if not headings:
+                continue
+            levels = [lvl for _, lvl in headings]
+            # Only one <h1>
+            if levels.count(1) > 1:
+                first_extra = next(ln for ln, lvl in headings if lvl == 1 and headings.index((ln, lvl)) > 0)
+                violations.append((headings[levels.index(1, 1)][0],
+                    f"<record model=\"website.page\"> arch has more than one <h1>"))
+            # Must start with h1
+            if levels[0] != 1:
+                violations.append((headings[0][0],
+                    f"<record model=\"website.page\"> arch heading hierarchy does not start with <h1>"
+                    f" (found <h{levels[0]}>)"))
+            # Must not skip levels going down (can jump up freely)
+            for i in range(1, len(levels)):
+                if levels[i] > levels[i - 1] + 1:
+                    violations.append((headings[i][0],
+                        f"<record model=\"website.page\"> arch heading skips from"
+                        f" <h{levels[i-1]}> to <h{levels[i]}>"))
 
     # ── full-content regex: empty block tags ──────────────────────────────
     # Match <tag ...></tag> with only whitespace between (not self-closing void elements)
